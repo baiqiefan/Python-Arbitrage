@@ -61,21 +61,22 @@ poly_response = requests.get(
 poly_response.raise_for_status()
 poly_data = poly_response.json()
 
-first_market = poly_data[0]
+print("Number of Polymarket markets:", len(poly_data))
 
-question = first_market["question"]
-prices = json.loads(first_market["outcomePrices"])
+for market in poly_data:
+    question = market["question"]
+    prices = json.loads(market["outcomePrices"])
 
-yes_price = float(prices[0])
-no_price = float(prices[1])
+    yes_price = float(prices[0])
+    no_price = float(prices[1])
 
-best_bid = float(first_market["bestBid"])
-best_ask = float(first_market["bestAsk"])
-volume = float(first_market["volume24hr"])
-
-print("\nQuestion:", question)
-print("Yes Price:", yes_price)
-print("No Price:", no_price)
-print("Best Bid:", best_bid)
-print("Best Ask:", best_ask)
-print("24H Volume:", volume)
+    best_bid = float(market["bestBid"])
+    best_ask = float(market["bestAsk"])
+    volume = float(market["volume24hr"])
+    
+    print("\nQuestion:", question)
+    print("Yes Price:", yes_price)
+    print("No Price:", no_price)
+    print("Best Bid:", best_bid)
+    print("Best Ask:", best_ask)
+    print("24h Volume:", volume)

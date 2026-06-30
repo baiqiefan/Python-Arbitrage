@@ -16,6 +16,7 @@ markets = data["markets"]
 
 print("Number of markets: ", len(markets))
 printed = 0
+kalshi_markets = []
 
 for market in markets:
     title = market["title"]
@@ -33,6 +34,11 @@ for market in markets:
         continue
 
     printed = printed + 1
+    kalshi_markets.append({
+        "title": title,
+        "yes_ask": yes_ask,
+        "no_ask": no_ask,
+    })
 
     print("\nMarket: ", title)
     print("Ticker: ", ticker)
@@ -41,7 +47,7 @@ for market in markets:
     print("No Bid: ", no_bid)
     print("No Ask: ", no_ask)
     print("24h Volume: ", volume)
-
+ 
     spread = yes_ask - yes_bid
     print("Spread:", round(spread, 4))
 
@@ -49,6 +55,8 @@ print("\nNumber of markets printed: ", printed)
 
 
 print("\n\n===== POLYMARKET =====")
+print("\nStored Kalshi Markets:", len(kalshi_markets))
+print(kalshi_markets[0])
 
 poly_url = "https://gamma-api.polymarket.com/markets"
 
@@ -63,12 +71,20 @@ poly_data = poly_response.json()
 
 print("Number of Polymarket markets:", len(poly_data))
 
+poly_markets = []
+
 for market in poly_data:
     question = market["question"]
     prices = json.loads(market["outcomePrices"])
 
     yes_price = float(prices[0])
     no_price = float(prices[1])
+
+    poly_markets.append({
+        "question": question,
+        "yes_price": yes_price,
+        "no_price": no_price,
+    })
 
     best_bid = float(market["bestBid"])
     best_ask = float(market["bestAsk"])
@@ -80,3 +96,6 @@ for market in poly_data:
     print("Best Bid:", best_bid)
     print("Best Ask:", best_ask)
     print("24h Volume:", volume)
+
+print("\nStored Polymarket markets:", len(poly_markets))
+print(poly_markets[0])

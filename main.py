@@ -103,6 +103,8 @@ print("\nStored Polymarket markets:", len(poly_markets))
 
 print("\n\n===== CHECKING FOR ARBITRAGE =====")
 
+found = 0
+
 for k in kalshi_markets:
     for p in poly_markets:
         if abs(k["strike"] - p["strike"]) > 50:
@@ -119,5 +121,16 @@ for k in kalshi_markets:
         print("  Kalshi-Yes + Poly-No cost:", round(cost, 4))
 
         if cost < 1.00:
+            found = found + 1
             print("  >>> ARBITRAGE! profit:", round(1 - cost, 4))
+        
+        cost2 = p["yes_price"] + k["no_ask"]
+        print("  Poly-Yes + Kalshi-No cost:", round(cost2, 4))
+
+        if cost2 < 1.00:
+            print("  >>> ARBITRAGE! profit:", round(1 - cost2, 4))
+            found = found + 1
+
+if found == 0:
+    print("No arbitrage found. Markets are fairly priced or don't match.")
 

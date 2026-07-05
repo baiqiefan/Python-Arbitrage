@@ -5,7 +5,7 @@ kalshi_url = "https://external-api.kalshi.com/trade-api/v2/markets"
 
 response = requests.get(
     kalshi_url,
-    params = {"limit" : 100 , "status": "open", "series_ticker": "KXBTCD"},
+    params = {"limit" : 1000 , "status": "open", "series_ticker": "KXBTCD"},
     timeout = 10
 )
 

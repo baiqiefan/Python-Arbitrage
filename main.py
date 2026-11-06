@@ -254,10 +254,15 @@ def report(db):
               f" range ${low:+,.2f} to ${high:+,.2f}")
 
     print("Data issues:")
-    rows = db.execute("SELECT reason, COUNT(*) FROM issues GROUP BY reason ORDER BY 2 DESC").fetchall()
-    for reason, count in rows:
-        print(f"  {count}  {reason}")
-    if not rows:
+    # Error messages include the URL, so group by the error's name, e.g. "ConnectionError".
+    groups = {}
+    for platform, reason, ts in db.execute("SELECT platform, reason, ts FROM issues ORDER BY ts"):
+        key = (platform, reason.split("(")[0])
+        count, first, _ = groups.get(key, (0, ts, ts))
+        groups[key] = (count + 1, first, ts)
+    for (platform, kind), (count, first, last) in sorted(groups.items(), key=lambda item: -item[1][0]):
+        print(f"  {count}  {kind} ({platform}), {first[:16]} to {last[:16]}")
+    if not groups:
         print("  none")
 
 

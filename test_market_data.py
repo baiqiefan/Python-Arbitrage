@@ -247,6 +247,15 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT kalshi_result, kalshi_value, poly_result FROM settlements").fetchone(),
                          ("yes", 82100.0, "no"))
 
+    def test_report_groups_errors_by_type(self):
+        for minute, url in (("09:06", "/markets/A"), ("09:07", "/markets/B")):
+            main.record_issue(self.db, f"2026-11-06T{minute}:00", "settlement",
+                              "x", f"ConnectionError(MaxRetryError('{url}'))")
+        main.record_issue(self.db, "2026-11-06T09:08:00", "kalshi", "T", "crossed book")
+        lines = self.report_lines()
+        self.assertIn("  2  ConnectionError (settlement), 2026-11-06T09:06 to 2026-11-06T09:07", lines)
+        self.assertIn("  1  crossed book (kalshi), 2026-11-06T09:08 to 2026-11-06T09:08", lines)
+
     def test_scan_logs_prices_and_minutes_left(self):
         main.scan(self.db, now=BEFORE)
         self.assertEqual(self.db.execute("SELECT binance, coinbase FROM prices").fetchone(), (75680.0, 75580.0))

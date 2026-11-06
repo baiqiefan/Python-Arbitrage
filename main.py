@@ -179,9 +179,11 @@ def one_quote_per_trade(rows):
     Rows are (kalshi_ticker, poly_id, direction, ts, net_per_contract, kalshi_result, poly_result),
     oldest first.
     """
-    # TODO(human): choose which quote stands for each trade, and return those rows.
-    return rows
-
+    trades = {}
+    for row in rows:
+        trades.setdefault(row[:3], row)
+    
+    return list(trades.values())
 
 def report(db):
     scans, with_pairs = db.execute(

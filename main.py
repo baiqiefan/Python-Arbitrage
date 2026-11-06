@@ -1,136 +1,158 @@
+"""Compare Kalshi and Polymarket Bitcoin order books and log the results."""
+import argparse
+import sqlite3
+import time
+from datetime import datetime, timezone
+
 import requests
-import json
 
-kalshi_url = "https://external-api.kalshi.com/trade-api/v2/markets"
-
-response = requests.get(
-    kalshi_url,
-    params = {"limit" : 1000 , "status": "open", "series_ticker": "KXBTCD"},
-    timeout = 10
+from market_data import (
+    book_flags,
+    coverage,
+    directions,
+    fetch_kalshi_book,
+    fetch_kalshi_markets,
+    fetch_poly_book,
+    fetch_poly_markets,
+    match_markets,
+    net_per_contract,
+    simulate_fill,
 )
 
-response.raise_for_status()
+DB_PATH = "market_data.db"
+SCAN_SECONDS = 60
 
-data = response.json()
-markets = data["markets"]
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS scans (
+    ts TEXT, kalshi_open INTEGER, poly_open INTEGER, shared_times INTEGER,
+    matched_pairs INTEGER, closest_gap_minutes REAL, skipped INTEGER
+);
+CREATE TABLE IF NOT EXISTS quotes (
+    ts TEXT, kalshi_ticker TEXT, poly_id TEXT, direction TEXT,
+    kalshi_source TEXT, poly_source TEXT,
+    kalshi_ask REAL, kalshi_size REAL, poly_ask REAL, poly_size REAL,
+    net_per_contract REAL, fillable_contracts INTEGER, leg_gap_seconds REAL, flags TEXT
+);
+CREATE TABLE IF NOT EXISTS issues (
+    ts TEXT, platform TEXT, market_id TEXT, reason TEXT
+);
+"""
 
-print("Number of markets: ", len(markets))
-printed = 0
-kalshi_markets = []
 
-for market in markets:
-    title = market["title"]
-    ticker = market["ticker"]
-    close_time = market["close_time"]
-    yes_bid = float(market["yes_bid_dollars"])
-    yes_ask = float(market["yes_ask_dollars"])
-    no_bid = float(market["no_bid_dollars"])
-    no_ask = float(market["no_ask_dollars"])
-    volume = float(market["volume_24h_fp"])
+def open_db(path=DB_PATH):
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    return db
 
-    if yes_ask <= 0 or yes_ask >= 1:
-        continue
 
-    if no_ask <= 0 or no_ask >= 1:
-        continue
+def record_issue(db, now, platform, market_id, reason):
+    db.execute("INSERT INTO issues VALUES (?, ?, ?, ?)", (now, platform, market_id, reason))
 
-    printed = printed + 1
-    strike = float(ticker.split("-T")[1])
 
-    kalshi_markets.append({
-        "strike": strike,
-        "yes_ask": yes_ask,
-        "no_ask": no_ask,
-        "close_time": close_time,
-    })
+def scan_pair(db, now, k, p):
+    k_book = fetch_kalshi_book(k["ticker"])
+    p_book = fetch_poly_book(p["yes_token"])
+    leg_gap = abs((p_book["fetched_at"] - k_book["fetched_at"]).total_seconds())
 
-    print("\nMarket: ", title)
-    print("Strike: ", strike)
-    print("Ticker: ", ticker)
-    print("Yes Ask: ", yes_ask)
-    print("Yes Bid: ", yes_bid)
-    print("No Bid: ", no_bid)
-    print("No Ask: ", no_ask)
-    print("24h Volume: ", volume)
-    print("Close Time: ", close_time)
- 
-    spread = yes_ask - yes_bid
-    print("Spread:", round(spread, 4))
+    k_flags = book_flags(k_book)
+    p_flags = book_flags(p_book)
+    for flag in k_flags:
+        record_issue(db, now, "kalshi", k["ticker"], flag)
+    for flag in p_flags:
+        record_issue(db, now, "polymarket", p["id"], flag)
+    flags = ", ".join(k_flags + p_flags)
 
-print("\nNumber of markets printed: ", printed)
+    print(f"\n{k['ticker']} vs Polymarket {p['id']}  strike {p['strike']:,.0f}")
+    print(f"  Settles on: {k['source']} vs {p['source']}")
 
-print("\n\n===== POLYMARKET BITCOIN =====")
-
-search_url = "https://gamma-api.polymarket.com/public-search"
-
-search_response = requests.get(
-    search_url,
-    params = {"q": "bitcoin", "limit_per_type": 10},
-    timeout = 10
-)
-
-search_response.raise_for_status()
-search_data = search_response.json()
-
-events = search_data["events"]
-
-poly_markets = []
-
-for event in events:
-    if event["closed"]:
-        continue
-
-    if "above" not in event["title"]:
-        continue
-
-    for market in event["markets"]:
-        strike = float(market["groupItemTitle"].replace(",", ""))
-        prices = json.loads(market["outcomePrices"])
-        yes_price = float(prices[0])
-        no_price = float(prices[1])
-        end_date = market["endDate"]
-
-        poly_markets.append({
-            "strike": strike,
-            "yes_price": yes_price,
-            "no_price": no_price,
-            "end_date": end_date,
-        })
-
-        print("Strike:", strike, "-> No:", no_price, "End:", end_date)
-
-print("\nStored Polymarket markets:", len(poly_markets))
-
-print("\n\n===== CHECKING FOR ARBITRAGE =====")
-
-found = 0
-
-for k in kalshi_markets:
-    for p in poly_markets:
-        if abs(k["strike"] - p["strike"]) > 50:
+    for direction, k_asks, p_asks in directions(k_book, p_book):
+        if not k_asks or not p_asks:
+            print(f"  {direction}: no asks on one side")
             continue
-        
-        if k["close_time"] != p["end_date"]:
-            continue
+        fill = simulate_fill(k_asks, p_asks, p["fee_rate"], p["min_size"])
+        net = net_per_contract(k_asks[0][0], p_asks[0][0], p["fee_rate"])
+        contracts = fill["contracts"] if fill else 0
+        db.execute(
+            "INSERT INTO quotes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, k["ticker"], p["id"], direction, k["source"], p["source"],
+             k_asks[0][0], k_asks[0][1], p_asks[0][0], p_asks[0][1], net, contracts, leg_gap, flags),
+        )
+        print(f"  {direction}: asks {k_asks[0][0]} + {p_asks[0][0]},"
+              f" net ${net:.4f} per contract, fillable {contracts}" + (f"  [{flags}]" if flags else ""))
 
-        cost = k["yes_ask"] + p["no_price"]
 
-        print("\nMatched strike ~", p["strike"])
-        print("  Kalshi  Yes:", k["yes_ask"], " No:", k["no_ask"])
-        print("  Poly    Yes:", p["yes_price"], " No:", p["no_price"])
-        print("  Kalshi-Yes + Poly-No cost:", round(cost, 4))
+def scan(db, now=None):
+    now = now or datetime.now(timezone.utc).isoformat()
+    kalshi_markets, kalshi_skipped = fetch_kalshi_markets()
+    poly_markets, poly_skipped = fetch_poly_markets()
+    skipped = kalshi_skipped + poly_skipped
+    for platform, market_id, reason in skipped:
+        record_issue(db, now, platform, market_id, reason)
 
-        if cost < 1.00:
-            found = found + 1
-            print("  >>> ARBITRAGE! profit:", round(1 - cost, 4))
-        
-        cost2 = p["yes_price"] + k["no_ask"]
-        print("  Poly-Yes + Kalshi-No cost:", round(cost2, 4))
+    pairs = match_markets(kalshi_markets, poly_markets)
+    seen = coverage(kalshi_markets, poly_markets)
 
-        if cost2 < 1.00:
-            print("  >>> ARBITRAGE! profit:", round(1 - cost2, 4))
-            found = found + 1
+    for k, p in pairs:
+        try:
+            scan_pair(db, now, k, p)
+        except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+            record_issue(db, now, "pair", f"{k['ticker']}/{p['id']}", repr(error))
+            print(f"\n{k['ticker']} vs Polymarket {p['id']}: book failed, {error}")
 
-if found == 0:
-    print("No arbitrage found. Markets are fairly priced or don't match.")
+    db.execute("INSERT INTO scans VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (now, len(kalshi_markets), len(poly_markets), seen["shared_times"],
+                len(pairs), seen["closest_gap_minutes"], len(skipped)))
+    db.commit()
 
+    gap = seen["closest_gap_minutes"]
+    print(f"\n{now}")
+    print(f"Open markets: Kalshi {len(kalshi_markets)}, Polymarket {len(poly_markets)}, skipped {len(skipped)}")
+    print(f"Shared settlement times: {seen['shared_times']}, matched pairs: {len(pairs)}")
+    print("Closest settlement gap at an equal strike:",
+          f"{gap:.0f} minutes" if gap is not None else "no equal strikes")
+
+
+def report(db):
+    scans, with_pairs = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(matched_pairs > 0), 0) FROM scans").fetchone()
+    print(f"Scans: {scans}  with a matched pair: {with_pairs}")
+
+    quotes, positive, best = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(net_per_contract > 0), 0), MAX(net_per_contract)"
+        " FROM quotes WHERE flags = ''").fetchone()
+    print(f"Clean quotes: {quotes}  profitable after fees: {positive}")
+    if best is not None:
+        print(f"Best net per contract: ${best:.4f}")
+
+    print("Data issues:")
+    rows = db.execute("SELECT reason, COUNT(*) FROM issues GROUP BY reason ORDER BY 2 DESC").fetchall()
+    for reason, count in rows:
+        print(f"  {count}  {reason}")
+    if not rows:
+        print("  none")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--loop", action="store_true", help=f"scan every {SCAN_SECONDS} seconds")
+    parser.add_argument("--report", action="store_true", help="summarize logged data and exit")
+    args = parser.parse_args()
+
+    db = open_db()
+    if args.report:
+        report(db)
+        return
+
+    while True:
+        try:
+            scan(db)
+        except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+            db.rollback()
+            print("Scan failed:", error)
+        if not args.loop:
+            return
+        time.sleep(SCAN_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

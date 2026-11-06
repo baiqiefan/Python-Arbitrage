@@ -9,24 +9,27 @@ It focuses on **Bitcoin price markets** ("will BTC be above $X at settlement?") 
 ## How it works
 
 1. **Fetch** open Bitcoin markets from both platforms:
-   - Kalshi — the `KXBTCD` daily price series.
-   - Polymarket — the Gamma API search for `bitcoin`.
-2. **Extract** two things from every market:
-   - the **strike price** (Kalshi hides it in the ticker, e.g. `KXBTCD-26JUL0512-T61999.99` → `$61,999.99`; Polymarket exposes it in `groupItemTitle`).
-   - the **settlement time** (Kalshi `close_time`, Polymarket `endDate`).
+   - Kalshi — the `KXBTCD` price series.
+   - Polymarket — the Gamma API search for active `bitcoin above` events, used for market details only.
+2. **Normalize** every market into the same fields: strike, settlement time, settlement source and fees. A malformed market is logged and skipped instead of stopping the scan.
 3. **Match** a Kalshi market to a Polymarket market only when **both** agree:
-   - strike prices are within $50 of each other, **and**
+   - strike prices differ by no more than 2 cents (Kalshi's `81999.99` vs Polymarket's `82000`), **and**
    - they settle at the **exact same time**.
-4. **Check both directions** for a guaranteed profit:
-   - Kalshi-Yes + Polymarket-No < \$1.00, or
-   - Polymarket-Yes + Kalshi-No < \$1.00.
-5. **Report honestly** — if nothing truly matches, it says so instead of inventing a fake opportunity.
+4. **Read the order books** for matched pairs and convert both to one format. A YES ask is `1 - best NO bid` on either platform.
+5. **Check both directions** using real ask prices and available size, after fees:
+   - Kalshi-Yes + Polymarket-No, and
+   - Polymarket-Yes + Kalshi-No.
+6. **Log everything** to `market_data.db`, including scans with no match and any data problems, so results can be measured over time.
 
 ### Why the settlement-time check matters
 
 Matching on strike price *alone* produces **false positives**. Two markets can both be "BTC above $62,000" yet settle **hours apart** — Bitcoin can move a lot in between, so they are *not* the same bet. The tool only treats a pair as arbitrage when the strike **and** the settlement timestamp match exactly.
 
-On these two platforms the alignment is real: Kalshi's noon-ET Bitcoin market (`...12` in the ticker) settles at **16:00 UTC**, the same moment Polymarket resolves. That match is only *tradeable* during the midday window, so run the tool around **midday ET** to catch a live pair.
+Polymarket's daily markets settle at **noon ET** (16:00 UTC in daylight saving time, 17:00 UTC otherwise), so a pair can only appear while Kalshi has a market open for that same time. Matches are not guaranteed at any given moment, which is why each scan logs how close the two platforms came.
+
+### Matched pairs still aren't risk-free
+
+The two platforms settle on **different prices**. Kalshi uses a 60-second average of the CF Benchmarks BRTI index, while Polymarket uses a Binance BTC/USDT candle close. If those land on opposite sides of the strike, the two legs can both lose. The scanner records both sources with every quote.
 
 ## Requirements
 
@@ -40,16 +43,21 @@ pip install requests
 ## Usage
 
 ```bash
-python main.py
+python main.py            # run one scan
+python main.py --loop     # scan every 60 seconds
+python main.py --report   # summarize the logged data
+python -m unittest        # run the tests
 ```
 
-The script prints each platform's Bitcoin markets, then a `CHECKING FOR ARBITRAGE` section listing any true matched pairs (or `No arbitrage found`).
+Each scan prints any matched pairs with their prices and profit after fees, then a summary of how many markets were open and how close the platforms came to matching.
+
+`paper_trade.py` holds simulated trading code that is parked until the scanner has collected enough data to choose a trading rule.
 
 ## Limitations
 
 This finds *theoretical* price gaps, not free money. A real trade would also have to account for:
 
-- **Trading fees and bid/ask spreads**, which eat thin margins.
+- **Different settlement prices**, as explained above. Fees and spreads are already included, using each platform's published fee formula.
 - **Speed** — professional bots take real mispricings in milliseconds.
 - **Capital lockup** until settlement.
 - **Legal/access** — Kalshi is US-regulated (CFTC); Polymarket is restricted for US persons.
@@ -57,7 +65,9 @@ This finds *theoretical* price gaps, not free money. A real trade would also hav
 ## Roadmap
 
 - [x] Compare Kalshi vs Polymarket Bitcoin prices
-- [x] Match on strike **and** settlement time (no false positives)
+- [x] Match on strike **and** settlement time
+- [x] Use real order book prices and fees
+- [x] Log scans and data problems over time
 - [x] Check both arbitrage directions
 - [ ] Add more prediction markets
 - [ ] (Someday, maybe) automated trading

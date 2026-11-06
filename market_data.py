@@ -166,16 +166,41 @@ def fetch_poly_book(yes_token):
 
 
 def book_flags(book):
-    """Return a list of data problems in a book, such as ["empty yes side"]. Empty means clean."""
+    """Return a list of data problems in a book, such as ["crossed book"]. Empty means clean.
+
+    An empty side is normal for strikes far from the price, so it isn't flagged here.
+    """
     flags = []
-    if not book["yes_bids"]:
-        flags.append("empty yes side")
-    if not book["no_bids"]:
-        flags.append("empty no side")
     # A healthy book's best bids add up to $1.00 or less; more means stale or broken data.
     if book["yes_bids"] and book["no_bids"] and book["yes_bids"][0][0] + book["no_bids"][0][0] > 1:
         flags.append("crossed book")
     return flags
+
+
+def kalshi_settlement(ticker):
+    """Return (result, settlement value), or (None, None) before Kalshi publishes them."""
+    market = get_json(f"{KALSHI_URL}/markets/{ticker}")["market"]
+    if not market["result"]:
+        return None, None
+    return market["result"], float(market["expiration_value"]) if market.get("expiration_value") else None
+
+
+def poly_result(market_id):
+    market = get_json(f"{GAMMA_URL}/markets/{market_id}")
+    if not market["closed"] or market.get("umaResolutionStatus") != "resolved":
+        return None
+    prices = [float(price) for price in json.loads(market["outcomePrices"])]
+    if prices == [1, 0]:
+        return "yes"
+    if prices == [0, 1]:
+        return "no"
+    return None
+
+
+def legs_won(direction, kalshi_result, poly_result):
+    """How many of the two legs paid $1. One is the plan; 0 or 2 means the sources split."""
+    kalshi_side, poly_side = ("yes", "no") if direction == "kalshi_yes_poly_no" else ("no", "yes")
+    return (kalshi_result == kalshi_side) + (poly_result == poly_side)
 
 
 def directions(k_book, p_book):

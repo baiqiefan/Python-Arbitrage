@@ -1,11 +1,13 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import main
 import market_data as md
 
 SETTLES = datetime(2026, 11, 5, 17, tzinfo=timezone.utc)
+BEFORE = SETTLES - timedelta(minutes=10)
+AFTER = SETTLES + timedelta(minutes=10)
 KALSHI = {"ticker": "KXBTCD-26NOV0512-T81999.99", "strike": 81999.99, "settles_at": SETTLES,
           "source": "CF BRTI 60s average"}
 POLY = {"id": "1", "strike": 82000.0, "settles_at": SETTLES, "source": "Binance BTC/USDT 1m close",
@@ -92,9 +94,29 @@ class FlagTests(unittest.TestCase):
     def test_crossed_book(self):
         self.assertEqual(md.book_flags(md.make_book([(0.55, 10)], [(0.50, 10)])), ["crossed book"])
 
-    def test_empty_sides(self):
-        self.assertEqual(md.book_flags(md.make_book([], [])), ["empty yes side", "empty no side"])
-        self.assertEqual(md.book_flags(md.make_book([(0.40, 10)], [])), ["empty no side"])
+    def test_empty_sides_are_normal(self):
+        self.assertEqual(md.book_flags(md.make_book([], [])), [])
+        self.assertEqual(md.book_flags(md.make_book([(0.40, 10)], [])), [])
+
+
+class SettlementTests(unittest.TestCase):
+    def test_legs_won(self):
+        self.assertEqual(md.legs_won("kalshi_yes_poly_no", "yes", "yes"), 1)
+        self.assertEqual(md.legs_won("kalshi_yes_poly_no", "no", "yes"), 0)
+        self.assertEqual(md.legs_won("poly_yes_kalshi_no", "no", "yes"), 2)
+
+    def test_kalshi_settlement_before_and_after(self):
+        with mock.patch.object(md, "get_json", return_value={"market": {"result": "", "expiration_value": ""}}):
+            self.assertEqual(md.kalshi_settlement("T"), (None, None))
+        with mock.patch.object(md, "get_json", return_value={"market": {"result": "no", "expiration_value": "80329.27"}}):
+            self.assertEqual(md.kalshi_settlement("T"), ("no", 80329.27))
+
+    def test_poly_result_waits_for_resolution(self):
+        pending = {"closed": True, "umaResolutionStatus": "proposed", "outcomePrices": '["1", "0"]'}
+        with mock.patch.object(md, "get_json", return_value=pending):
+            self.assertIsNone(md.poly_result("1"))
+        with mock.patch.object(md, "get_json", return_value=dict(pending, umaResolutionStatus="resolved")):
+            self.assertEqual(md.poly_result("1"), "yes")
 
 
 class FillTests(unittest.TestCase):
@@ -150,8 +172,13 @@ class ScanTests(unittest.TestCase):
     def count(self, table):
         return self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
+    def report_lines(self):
+        with mock.patch("builtins.print") as printed:
+            main.report(self.db)
+        return [call.args[0] for call in printed.call_args_list]
+
     def test_scan_logs_both_directions_with_sources(self):
-        main.scan(self.db, now="t1")
+        main.scan(self.db, now=BEFORE)
         rows = self.db.execute("SELECT direction, kalshi_source, poly_source FROM quotes ORDER BY direction").fetchall()
         self.assertEqual([row[0] for row in rows], ["kalshi_yes_poly_no", "poly_yes_kalshi_no"])
         self.assertEqual(rows[0][1:], ("CF BRTI 60s average", "Binance BTC/USDT 1m close"))
@@ -160,18 +187,50 @@ class ScanTests(unittest.TestCase):
 
     def test_flagged_book_is_logged_but_left_out_of_report(self):
         with mock.patch.object(main, "book_flags", return_value=["crossed book"]):
-            main.scan(self.db, now="t1")
+            main.scan(self.db, now=BEFORE)
         self.assertEqual(self.count("quotes"), 2)
-        with mock.patch("builtins.print") as printed:
-            main.report(self.db)
-        printed.assert_any_call("Clean quotes: 0  profitable after fees: 0")
+        self.assertIn("Quotes: 2  tradeable: 0  profitable after fees: 0", self.report_lines())
 
     def test_one_failed_book_is_recorded_and_scan_finishes(self):
         with mock.patch.object(main, "fetch_kalshi_book", side_effect=ValueError("bad book")):
-            main.scan(self.db, now="t1")
+            main.scan(self.db, now=BEFORE)
         self.assertEqual(self.count("quotes"), 0)
         self.assertEqual(self.count("scans"), 1)
         self.assertEqual(self.count("issues"), 2)
+
+    def test_quote_without_asks_is_still_logged(self):
+        with mock.patch.object(main, "fetch_kalshi_book", return_value=md.make_book([], [(0.60, 50)])):
+            main.scan(self.db, now=BEFORE)
+        rows = self.db.execute("SELECT direction, kalshi_ask, fillable_contracts FROM quotes ORDER BY direction").fetchall()
+        self.assertEqual(rows[1], ("poly_yes_kalshi_no", None, 0))
+        self.assertIn("Quotes: 2  tradeable: 1  profitable after fees: 1", self.report_lines())
+
+    def test_report_flags_profit_that_compares_different_prices(self):
+        main.scan(self.db, now=BEFORE)
+        self.assertIn("  of those, settling on different prices (not risk-free): 1", self.report_lines())
+
+    def test_settlement_is_recorded_once_both_platforms_publish(self):
+        main.scan(self.db, now=BEFORE)
+        with mock.patch.object(main, "kalshi_settlement", return_value=("yes", 82100.0)), \
+                mock.patch.object(main, "poly_result", return_value=None):
+            main.settle_pairs(self.db, AFTER)
+        self.assertEqual(self.db.execute("SELECT kalshi_result, poly_result FROM settlements").fetchone(), ("yes", None))
+
+        with mock.patch.object(main, "kalshi_settlement", return_value=("yes", 82100.0)), \
+                mock.patch.object(main, "poly_result", return_value="no") as poly:
+            main.settle_pairs(self.db, AFTER)
+            poly.assert_not_called()  # checked less than SETTLE_CHECK_MINUTES ago
+            main.settle_pairs(self.db, AFTER + timedelta(minutes=main.SETTLE_CHECK_MINUTES))
+        self.assertEqual(self.db.execute("SELECT kalshi_result, kalshi_value, poly_result FROM settlements").fetchone(),
+                         ("yes", 82100.0, "no"))
+
+    def test_report_checks_profitable_quotes_against_results(self):
+        main.scan(self.db, now=BEFORE)
+        # Kalshi YES won and Polymarket NO won: both legs paid, which only a price split allows.
+        self.db.execute("UPDATE settlements SET kalshi_result = 'yes', poly_result = 'no'")
+        lines = self.report_lines()
+        self.assertIn("Matched pairs tracked: 1  settled: 1  where the platforms disagreed: 1", lines)
+        self.assertIn("Profitable quotes now settled: 1  paid once: 0  lost both legs: 0  won both: 1", lines)
 
 
 if __name__ == "__main__":

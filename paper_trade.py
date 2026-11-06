@@ -3,7 +3,6 @@
 Parked until main.py has collected data: should_take_trade has no rule yet.
 """
 import argparse
-import json
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -11,8 +10,6 @@ from datetime import datetime, timezone
 import requests
 
 from market_data import (
-    GAMMA_URL,
-    KALSHI_URL,
     book_flags,
     directions,
     fetch_kalshi_book,
@@ -20,8 +17,11 @@ from market_data import (
     fetch_poly_book,
     fetch_poly_markets,
     get_json,
+    kalshi_settlement,
+    legs_won,
     match_markets,
     parse_time,
+    poly_result,
     simulate_fill,
 )
 
@@ -88,25 +88,12 @@ def scan(db, now=None):
 
 
 def kalshi_result(ticker):
-    return get_json(f"{KALSHI_URL}/markets/{ticker}")["market"]["result"] or None
-
-
-def poly_result(market_id):
-    market = get_json(f"{GAMMA_URL}/markets/{market_id}")
-    if not market["closed"] or market.get("umaResolutionStatus") != "resolved":
-        return None
-    prices = [float(price) for price in json.loads(market["outcomePrices"])]
-    if prices == [1, 0]:
-        return "yes"
-    if prices == [0, 1]:
-        return "no"
-    return None
+    return kalshi_settlement(ticker)[0]
 
 
 def trade_pnl(trade):
     """Each leg pays $1 per contract if its side won. A $0 or $2 payout means the sources split."""
-    kalshi_side, poly_side = ("yes", "no") if trade["direction"] == "kalshi_yes_poly_no" else ("no", "yes")
-    wins = (trade["kalshi_result"] == kalshi_side) + (trade["poly_result"] == poly_side)
+    wins = legs_won(trade["direction"], trade["kalshi_result"], trade["poly_result"])
     costs = trade["kalshi_cost"] + trade["poly_cost"] + trade["kalshi_fee"] + trade["poly_fee"]
     return wins * trade["contracts"] - costs
 

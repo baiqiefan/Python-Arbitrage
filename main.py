@@ -2,7 +2,7 @@
 import argparse
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -14,13 +14,20 @@ from market_data import (
     fetch_kalshi_markets,
     fetch_poly_book,
     fetch_poly_markets,
+    kalshi_settlement,
+    legs_won,
     match_markets,
     net_per_contract,
+    parse_time,
+    poly_result,
     simulate_fill,
 )
 
 DB_PATH = "market_data.db"
 SCAN_SECONDS = 60
+# Polymarket can take an hour or more to resolve, so don't ask about every pair every minute.
+SETTLE_CHECK_MINUTES = 5
+SCAN_ERRORS = (requests.RequestException, KeyError, TypeError, ValueError, sqlite3.Error)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -36,17 +43,28 @@ CREATE TABLE IF NOT EXISTS quotes (
 CREATE TABLE IF NOT EXISTS issues (
     ts TEXT, platform TEXT, market_id TEXT, reason TEXT
 );
+CREATE TABLE IF NOT EXISTS settlements (
+    kalshi_ticker TEXT, poly_id TEXT, strike REAL, settles_at TEXT,
+    kalshi_source TEXT, poly_source TEXT,
+    kalshi_result TEXT, kalshi_value REAL, poly_result TEXT, checked_at TEXT,
+    PRIMARY KEY (kalshi_ticker, poly_id)
+);
 """
 
 
 def open_db(path=DB_PATH):
-    db = sqlite3.connect(path)
+    # Wait for another writer instead of failing after the default 5 seconds.
+    db = sqlite3.connect(path, timeout=30)
     db.executescript(SCHEMA)
     return db
 
 
 def record_issue(db, now, platform, market_id, reason):
     db.execute("INSERT INTO issues VALUES (?, ?, ?, ?)", (now, platform, market_id, reason))
+
+
+def different_sources(k, p):
+    return k["source"] != p["source"]
 
 
 def scan_pair(db, now, k, p):
@@ -62,11 +80,23 @@ def scan_pair(db, now, k, p):
         record_issue(db, now, "polymarket", p["id"], flag)
     flags = ", ".join(k_flags + p_flags)
 
+    db.execute(
+        "INSERT OR IGNORE INTO settlements (kalshi_ticker, poly_id, strike, settles_at, kalshi_source, poly_source)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (k["ticker"], p["id"], p["strike"], p["settles_at"].isoformat(), k["source"], p["source"]),
+    )
+
     print(f"\n{k['ticker']} vs Polymarket {p['id']}  strike {p['strike']:,.0f}")
-    print(f"  Settles on: {k['source']} vs {p['source']}")
+    print(f"  Settles on: {k['source']} vs {p['source']}"
+          + ("  (different prices, so not risk-free)" if different_sources(k, p) else ""))
 
     for direction, k_asks, p_asks in directions(k_book, p_book):
         if not k_asks or not p_asks:
+            # Logged with no prices, so the report can count untradeable pairs.
+            db.execute(
+                "INSERT INTO quotes VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, ?)",
+                (now, k["ticker"], p["id"], direction, k["source"], p["source"], leg_gap, flags),
+            )
             print(f"  {direction}: no asks on one side")
             continue
         fill = simulate_fill(k_asks, p_asks, p["fee_rate"], p["min_size"])
@@ -81,35 +111,76 @@ def scan_pair(db, now, k, p):
               f" net ${net:.4f} per contract, fillable {contracts}" + (f"  [{flags}]" if flags else ""))
 
 
+def settle_pairs(db, now):
+    """Record both platforms' results for matched pairs whose settlement time has passed."""
+    retry_before = (now - timedelta(minutes=SETTLE_CHECK_MINUTES)).isoformat()
+    rows = db.execute(
+        "SELECT kalshi_ticker, poly_id FROM settlements WHERE poly_result IS NULL AND settles_at <= ?"
+        " AND (checked_at IS NULL OR checked_at <= ?)",
+        (now.isoformat(), retry_before),
+    ).fetchall()
+    for ticker, poly_id in rows:
+        try:
+            k_result, k_value = kalshi_settlement(ticker)
+            p_result = poly_result(poly_id) if k_result else None
+        except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+            record_issue(db, now.isoformat(), "settlement", f"{ticker}/{poly_id}", repr(error))
+            # Wait the usual interval before retrying, instead of failing every scan.
+            db.execute("UPDATE settlements SET checked_at = ? WHERE kalshi_ticker = ? AND poly_id = ?",
+                       (now.isoformat(), ticker, poly_id))
+            continue
+        db.execute(
+            "UPDATE settlements SET kalshi_result = ?, kalshi_value = ?, poly_result = ?, checked_at = ?"
+            " WHERE kalshi_ticker = ? AND poly_id = ?",
+            (k_result, k_value, p_result, now.isoformat(), ticker, poly_id),
+        )
+        if p_result:
+            print(f"Settled {ticker} vs Polymarket {poly_id}: Kalshi {k_result}, Polymarket {p_result}")
+    db.commit()
+
+
 def scan(db, now=None):
-    now = now or datetime.now(timezone.utc).isoformat()
+    now = now or datetime.now(timezone.utc)
+    stamp = now.isoformat()
+    settle_pairs(db, now)
+
     kalshi_markets, kalshi_skipped = fetch_kalshi_markets()
     poly_markets, poly_skipped = fetch_poly_markets()
     skipped = kalshi_skipped + poly_skipped
     for platform, market_id, reason in skipped:
-        record_issue(db, now, platform, market_id, reason)
+        record_issue(db, stamp, platform, market_id, reason)
 
     pairs = match_markets(kalshi_markets, poly_markets)
     seen = coverage(kalshi_markets, poly_markets)
 
     for k, p in pairs:
         try:
-            scan_pair(db, now, k, p)
+            scan_pair(db, stamp, k, p)
         except (requests.RequestException, KeyError, TypeError, ValueError) as error:
-            record_issue(db, now, "pair", f"{k['ticker']}/{p['id']}", repr(error))
+            record_issue(db, stamp, "pair", f"{k['ticker']}/{p['id']}", repr(error))
             print(f"\n{k['ticker']} vs Polymarket {p['id']}: book failed, {error}")
 
     db.execute("INSERT INTO scans VALUES (?, ?, ?, ?, ?, ?, ?)",
-               (now, len(kalshi_markets), len(poly_markets), seen["shared_times"],
+               (stamp, len(kalshi_markets), len(poly_markets), seen["shared_times"],
                 len(pairs), seen["closest_gap_minutes"], len(skipped)))
     db.commit()
 
     gap = seen["closest_gap_minutes"]
-    print(f"\n{now}")
+    print(f"\n{stamp}")
     print(f"Open markets: Kalshi {len(kalshi_markets)}, Polymarket {len(poly_markets)}, skipped {len(skipped)}")
     print(f"Shared settlement times: {seen['shared_times']}, matched pairs: {len(pairs)}")
     print("Closest settlement gap at an equal strike:",
           f"{gap:.0f} minutes" if gap is not None else "no equal strikes")
+
+
+def one_quote_per_trade(rows):
+    """Keep one row per (kalshi_ticker, poly_id, direction), so a gap seen every minute counts once.
+
+    Rows are (kalshi_ticker, poly_id, direction, ts, net_per_contract, kalshi_result, poly_result),
+    oldest first.
+    """
+    # TODO(human): choose which quote stands for each trade, and return those rows.
+    return rows
 
 
 def report(db):
@@ -117,12 +188,37 @@ def report(db):
         "SELECT COUNT(*), COALESCE(SUM(matched_pairs > 0), 0) FROM scans").fetchone()
     print(f"Scans: {scans}  with a matched pair: {with_pairs}")
 
-    quotes, positive, best = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(net_per_contract > 0), 0), MAX(net_per_contract)"
-        " FROM quotes WHERE flags = ''").fetchone()
-    print(f"Clean quotes: {quotes}  profitable after fees: {positive}")
+    quotes, tradeable, positive, risky, best = db.execute(
+        "SELECT COUNT(*),"
+        " COALESCE(SUM(kalshi_ask IS NOT NULL AND flags = ''), 0),"
+        " COALESCE(SUM(net_per_contract > 0 AND flags = ''), 0),"
+        " COALESCE(SUM(net_per_contract > 0 AND flags = '' AND kalshi_source != poly_source), 0),"
+        " MAX(CASE WHEN flags = '' THEN net_per_contract END)"
+        " FROM quotes").fetchone()
+    print(f"Quotes: {quotes}  tradeable: {tradeable}  profitable after fees: {positive}")
+    print(f"  of those, settling on different prices (not risk-free): {risky}")
     if best is not None:
         print(f"Best net per contract: ${best:.4f}")
+
+    tracked, settled, split = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(poly_result IS NOT NULL), 0),"
+        " COALESCE(SUM(poly_result IS NOT NULL AND kalshi_result != poly_result), 0)"
+        " FROM settlements").fetchone()
+    print(f"Matched pairs tracked: {tracked}  settled: {settled}  where the platforms disagreed: {split}")
+
+    # Test each profitable quote against what really happened.
+    rows = db.execute(
+        "SELECT q.kalshi_ticker, q.poly_id, q.direction, q.ts, q.net_per_contract, s.kalshi_result, s.poly_result"
+        " FROM quotes q JOIN settlements s ON q.kalshi_ticker = s.kalshi_ticker AND q.poly_id = s.poly_id"
+        " WHERE q.net_per_contract > 0 AND q.flags = '' AND s.poly_result IS NOT NULL ORDER BY q.ts").fetchall()
+    outcomes = [row[2:] for row in one_quote_per_trade(rows)]
+    if outcomes:
+        legs = [legs_won(direction, k_result, p_result) for direction, _, _, k_result, p_result in outcomes]
+        # Cost per contract including fees is 1 - net, and each winning leg pays $1.
+        results = [won - 1 + net for won, (_, _, net, _, _) in zip(legs, outcomes)]
+        print(f"Profitable quotes now settled: {len(outcomes)}  paid once: {legs.count(1)}"
+              f"  lost both legs: {legs.count(0)}  won both: {legs.count(2)}")
+        print(f"Average real result per contract: ${sum(results) / len(results):.4f}")
 
     print("Data issues:")
     rows = db.execute("SELECT reason, COUNT(*) FROM issues GROUP BY reason ORDER BY 2 DESC").fetchall()
@@ -146,9 +242,9 @@ def main():
     while True:
         try:
             scan(db)
-        except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+        except SCAN_ERRORS as error:
             db.rollback()
-            print("Scan failed:", error)
+            print("Scan failed, will retry:", error)
         if not args.loop:
             return
         time.sleep(SCAN_SECONDS)

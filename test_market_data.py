@@ -153,6 +153,28 @@ class MatchTests(unittest.TestCase):
         self.assertIsNone(md.coverage([KALSHI], [dict(POLY, strike=70000.0)])["closest_gap_minutes"])
 
 
+class UpgradeTests(unittest.TestCase):
+    def test_old_database_gains_minutes_left(self):
+        import os
+        import sqlite3
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "old.db")
+        old = sqlite3.connect(path)
+        old.execute("CREATE TABLE quotes (ts TEXT, kalshi_ticker TEXT, poly_id TEXT, direction TEXT,"
+                    " kalshi_source TEXT, poly_source TEXT, kalshi_ask REAL, kalshi_size REAL, poly_ask REAL,"
+                    " poly_size REAL, net_per_contract REAL, fillable_contracts INTEGER, leg_gap_seconds REAL,"
+                    " flags TEXT)")
+        old.execute("INSERT INTO quotes (ts, flags) VALUES ('t0', '')")
+        old.commit()
+        old.close()
+        db = main.open_db(path)
+        columns = [row[1] for row in db.execute("PRAGMA table_info(quotes)")]
+        self.assertEqual(columns[-1], "minutes_left")
+        self.assertEqual(db.execute("SELECT ts, minutes_left FROM quotes").fetchone(), ("t0", None))
+        main.open_db(path).close()  # opening again must not try to add the column twice
+        db.close()
+
+
 class ScanTests(unittest.TestCase):
     def setUp(self):
         self.db = main.open_db(":memory:")
@@ -164,6 +186,7 @@ class ScanTests(unittest.TestCase):
             mock.patch.object(main, "fetch_kalshi_book", return_value=k_book),
             mock.patch.object(main, "fetch_poly_book", return_value=p_book),
             mock.patch.object(main, "book_flags", return_value=[]),
+            mock.patch.object(main, "fetch_spot_prices", return_value={"binance": 75680.0, "coinbase": 75580.0}),
         ]
         for patch in patches:
             patch.start()
@@ -223,6 +246,18 @@ class ScanTests(unittest.TestCase):
             main.settle_pairs(self.db, AFTER + timedelta(minutes=main.SETTLE_CHECK_MINUTES))
         self.assertEqual(self.db.execute("SELECT kalshi_result, kalshi_value, poly_result FROM settlements").fetchone(),
                          ("yes", 82100.0, "no"))
+
+    def test_scan_logs_prices_and_minutes_left(self):
+        main.scan(self.db, now=BEFORE)
+        self.assertEqual(self.db.execute("SELECT binance, coinbase FROM prices").fetchone(), (75680.0, 75580.0))
+        self.assertEqual({row[0] for row in self.db.execute("SELECT minutes_left FROM quotes")}, {10.0})
+        self.assertIn("Binance minus Coinbase over 1 scans: average $+100.00, range $+100.00 to $+100.00",
+                      self.report_lines())
+
+    def test_missing_price_is_stored_as_null(self):
+        with mock.patch.object(main, "fetch_spot_prices", return_value={"binance": None, "coinbase": 75580.0}):
+            main.scan(self.db, now=BEFORE)
+        self.assertEqual(self.db.execute("SELECT binance, coinbase FROM prices").fetchone(), (None, 75580.0))
 
     def test_report_checks_profitable_quotes_against_results(self):
         main.scan(self.db, now=BEFORE)

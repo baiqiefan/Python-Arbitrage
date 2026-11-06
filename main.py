@@ -14,6 +14,7 @@ from market_data import (
     fetch_kalshi_markets,
     fetch_poly_book,
     fetch_poly_markets,
+    fetch_spot_prices,
     kalshi_settlement,
     legs_won,
     match_markets,
@@ -38,10 +39,14 @@ CREATE TABLE IF NOT EXISTS quotes (
     ts TEXT, kalshi_ticker TEXT, poly_id TEXT, direction TEXT,
     kalshi_source TEXT, poly_source TEXT,
     kalshi_ask REAL, kalshi_size REAL, poly_ask REAL, poly_size REAL,
-    net_per_contract REAL, fillable_contracts INTEGER, leg_gap_seconds REAL, flags TEXT
+    net_per_contract REAL, fillable_contracts INTEGER, leg_gap_seconds REAL, flags TEXT,
+    minutes_left REAL
 );
 CREATE TABLE IF NOT EXISTS issues (
     ts TEXT, platform TEXT, market_id TEXT, reason TEXT
+);
+CREATE TABLE IF NOT EXISTS prices (
+    ts TEXT, binance REAL, coinbase REAL
 );
 CREATE TABLE IF NOT EXISTS settlements (
     kalshi_ticker TEXT, poly_id TEXT, strike REAL, settles_at TEXT,
@@ -56,6 +61,10 @@ def open_db(path=DB_PATH):
     # Wait for another writer instead of failing after the default 5 seconds.
     db = sqlite3.connect(path, timeout=30)
     db.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS leaves older databases alone, so add newer columns here.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(quotes)")}
+    if "minutes_left" not in columns:
+        db.execute("ALTER TABLE quotes ADD COLUMN minutes_left REAL")
     return db
 
 
@@ -67,7 +76,15 @@ def different_sources(k, p):
     return k["source"] != p["source"]
 
 
+QUOTE_COLUMNS = (
+    "ts, kalshi_ticker, poly_id, direction, kalshi_source, poly_source, kalshi_ask, kalshi_size,"
+    " poly_ask, poly_size, net_per_contract, fillable_contracts, leg_gap_seconds, flags, minutes_left"
+)
+
+
 def scan_pair(db, now, k, p):
+    minutes_left = (p["settles_at"] - now).total_seconds() / 60
+    now = now.isoformat()
     k_book = fetch_kalshi_book(k["ticker"])
     p_book = fetch_poly_book(p["yes_token"])
     leg_gap = abs((p_book["fetched_at"] - k_book["fetched_at"]).total_seconds())
@@ -94,8 +111,9 @@ def scan_pair(db, now, k, p):
         if not k_asks or not p_asks:
             # Logged with no prices, so the report can count untradeable pairs.
             db.execute(
-                "INSERT INTO quotes VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, ?)",
-                (now, k["ticker"], p["id"], direction, k["source"], p["source"], leg_gap, flags),
+                f"INSERT INTO quotes ({QUOTE_COLUMNS})"
+                " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, ?, ?, ?)",
+                (now, k["ticker"], p["id"], direction, k["source"], p["source"], leg_gap, flags, minutes_left),
             )
             print(f"  {direction}: no asks on one side")
             continue
@@ -103,9 +121,10 @@ def scan_pair(db, now, k, p):
         net = net_per_contract(k_asks[0][0], p_asks[0][0], p["fee_rate"])
         contracts = fill["contracts"] if fill else 0
         db.execute(
-            "INSERT INTO quotes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO quotes ({QUOTE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now, k["ticker"], p["id"], direction, k["source"], p["source"],
-             k_asks[0][0], k_asks[0][1], p_asks[0][0], p_asks[0][1], net, contracts, leg_gap, flags),
+             k_asks[0][0], k_asks[0][1], p_asks[0][0], p_asks[0][1], net, contracts, leg_gap, flags,
+             minutes_left),
         )
         print(f"  {direction}: asks {k_asks[0][0]} + {p_asks[0][0]},"
               f" net ${net:.4f} per contract, fillable {contracts}" + (f"  [{flags}]" if flags else ""))
@@ -152,10 +171,12 @@ def scan(db, now=None):
 
     pairs = match_markets(kalshi_markets, poly_markets)
     seen = coverage(kalshi_markets, poly_markets)
+    spot = fetch_spot_prices()
+    db.execute("INSERT INTO prices VALUES (?, ?, ?)", (stamp, spot["binance"], spot["coinbase"]))
 
     for k, p in pairs:
         try:
-            scan_pair(db, stamp, k, p)
+            scan_pair(db, now, k, p)
         except (requests.RequestException, KeyError, TypeError, ValueError) as error:
             record_issue(db, stamp, "pair", f"{k['ticker']}/{p['id']}", repr(error))
             print(f"\n{k['ticker']} vs Polymarket {p['id']}: book failed, {error}")
@@ -171,6 +192,9 @@ def scan(db, now=None):
     print(f"Shared settlement times: {seen['shared_times']}, matched pairs: {len(pairs)}")
     print("Closest settlement gap at an equal strike:",
           f"{gap:.0f} minutes" if gap is not None else "no equal strikes")
+    if spot["binance"] is not None and spot["coinbase"] is not None:
+        print(f"BTC: Binance ${spot['binance']:,.2f}, Coinbase ${spot['coinbase']:,.2f},"
+              f" gap ${spot['binance'] - spot['coinbase']:+,.2f}")
 
 
 def one_quote_per_trade(rows):
@@ -221,6 +245,13 @@ def report(db):
         print(f"Profitable quotes now settled: {len(outcomes)}  paid once: {legs.count(1)}"
               f"  lost both legs: {legs.count(0)}  won both: {legs.count(2)}")
         print(f"Average real result per contract: ${sum(results) / len(results):.4f}")
+
+    count, average, low, high = db.execute(
+        "SELECT COUNT(*), AVG(binance - coinbase), MIN(binance - coinbase), MAX(binance - coinbase)"
+        " FROM prices WHERE binance IS NOT NULL AND coinbase IS NOT NULL").fetchone()
+    if count:
+        print(f"Binance minus Coinbase over {count} scans: average ${average:+,.2f},"
+              f" range ${low:+,.2f} to ${high:+,.2f}")
 
     print("Data issues:")
     rows = db.execute("SELECT reason, COUNT(*) FROM issues GROUP BY reason ORDER BY 2 DESC").fetchall()

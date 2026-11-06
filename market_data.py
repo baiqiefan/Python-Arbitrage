@@ -8,6 +8,9 @@ import requests
 KALSHI_URL = "https://external-api.kalshi.com/trade-api/v2"
 GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
+# Polymarket settles on Binance BTC/USDT. Coinbase BTC/USD stands in for Kalshi's BRTI index.
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+COINBASE_PRICE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 
 MAX_CONTRACTS = 100
 # Kalshi strikes end in .99 (81999.99) and Polymarket's are round (82000).
@@ -176,6 +179,21 @@ def book_flags(book):
         flags.append("crossed book")
     return flags
 
+
+def fetch_spot_prices():
+    """Return {"binance": price, "coinbase": price}, the BTC price each platform's settlement follows.
+
+    Binance: get_json(BINANCE_PRICE_URL, symbol="BTCUSDT") returns {"price": "75680.00"}.
+    Coinbase: get_json(COINBASE_PRICE_URL) returns {"price": "75580.12", ...}.
+    """
+    prices = {}
+    for name, url, params in (("binance", BINANCE_PRICE_URL, {"symbol": "BTCUSDT"}),
+                              ("coinbase", COINBASE_PRICE_URL, {})):
+        try:
+            prices[name] = float(get_json(url, **params)["price"])
+        except (requests.RequestException, KeyError, TypeError, ValueError):
+            prices[name] = None
+    return prices
 
 def kalshi_settlement(ticker):
     """Return (result, settlement value), or (None, None) before Kalshi publishes them."""

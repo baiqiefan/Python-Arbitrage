@@ -1,6 +1,7 @@
 """Fetch Kalshi and Polymarket Bitcoin markets and order books in one shared format."""
 import json
 import math
+import statistics
 from datetime import datetime, timezone
 
 import requests
@@ -8,13 +9,26 @@ import requests
 KALSHI_URL = "https://external-api.kalshi.com/trade-api/v2"
 GAMMA_URL = "https://gamma-api.polymarket.com"
 CLOB_URL = "https://clob.polymarket.com"
-# Polymarket settles on Binance BTC/USDT. Coinbase BTC/USD stands in for Kalshi's BRTI index.
+# Polymarket settles on Binance BTC/USDT. Kalshi settles on CF BRTI, which is built from several
+# USD exchanges; Coinbase, Kraken and Bitstamp are three of them, so together they stand in for it.
 BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
 COINBASE_PRICE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+KRAKEN_PRICE_URL = "https://api.kraken.com/0/public/Ticker"
+BITSTAMP_PRICE_URL = "https://www.bitstamp.net/api/v2/ticker/btcusd/"
+# (name, url, query params, how to pull the last trade price out of the reply)
+SPOT_SOURCES = (
+    ("binance", BINANCE_PRICE_URL, {"symbol": "BTCUSDT"}, lambda data: data["price"]),
+    ("coinbase", COINBASE_PRICE_URL, {}, lambda data: data["price"]),
+    # Kraken replies {"error": [], "result": {"XXBTZUSD": {"c": ["75991.6", "0.0005"], ...}}}
+    ("kraken", KRAKEN_PRICE_URL, {"pair": "XBTUSD"}, lambda data: data["result"]["XXBTZUSD"]["c"][0]),
+    ("bitstamp", BITSTAMP_PRICE_URL, {}, lambda data: data["last"]),
+)
+BRTI_STAND_INS = ("coinbase", "kraken", "bitstamp")
 
 MAX_CONTRACTS = 100
 # Kalshi strikes end in .99 (81999.99) and Polymarket's are round (82000).
 MAX_STRIKE_GAP = 0.02
+DANGER_DOLLARS_PER_SQRT_MINUTE = 50
 KALSHI_FEE_RATE = 0.07
 
 
@@ -181,19 +195,39 @@ def book_flags(book):
 
 
 def fetch_spot_prices():
-    """Return {"binance": price, "coinbase": price}, the BTC price each platform's settlement follows.
-
-    Binance: get_json(BINANCE_PRICE_URL, symbol="BTCUSDT") returns {"price": "75680.00"}.
-    Coinbase: get_json(COINBASE_PRICE_URL) returns {"price": "75580.12", ...}.
-    """
+    """Return {name: BTC price or None} for every exchange in SPOT_SOURCES."""
     prices = {}
-    for name, url, params in (("binance", BINANCE_PRICE_URL, {"symbol": "BTCUSDT"}),
-                              ("coinbase", COINBASE_PRICE_URL, {})):
+    for name, url, params, pick in SPOT_SOURCES:
         try:
-            prices[name] = float(get_json(url, **params)["price"])
-        except (requests.RequestException, KeyError, TypeError, ValueError):
+            prices[name] = float(pick(get_json(url, **params)))
+        except (requests.RequestException, KeyError, IndexError, TypeError, ValueError):
             prices[name] = None
     return prices
+
+
+def brti_proxy(prices):
+    """Estimate Kalshi's BRTI from the exchanges in BRTI_STAND_INS.
+
+    prices is fetch_spot_prices() output; any exchange may be None if its request failed.
+    Returns a float, or None when there isn't enough data to trust an estimate.
+    """
+    available = [prices[name] for name in BRTI_STAND_INS if prices.get(name) is not None]
+    if len(available) < 2:
+        return None
+    return statistics.median(available)
+
+
+def in_danger_zone(strike, binance, brti, minutes_left):
+    """True if the two platforms could settle this strike differently.
+
+    Kalshi settles on BRTI and Polymarket on Binance, and Binance has been running about $100 above.
+    A strike between the two prices at settlement makes both legs lose. At quote time we only know
+    today's binance and brti (the brti_proxy estimate), and BTC still moves for minutes_left minutes.
+    """
+    margin = DANGER_DOLLARS_PER_SQRT_MINUTE * math.sqrt(max(minutes_left, 0))
+    low = min(binance, brti) - margin
+    high = max(binance, brti) + margin
+    return low <= strike <= high
 
 def kalshi_settlement(ticker):
     """Return (result, settlement value), or (None, None) before Kalshi publishes them."""

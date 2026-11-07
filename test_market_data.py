@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from operator import itemgetter
 from unittest import mock
 
 import main
@@ -177,7 +178,87 @@ class GapRunTests(unittest.TestCase):
         self.assertEqual(main.gap_runs([(at(0), -0.2), (at(1), 0.1), (at(2), 0.1)]), [(at(1), at(2))])
 
 
+SPOT = {"binance": 75680.0, "coinbase": 75580.0, "kraken": 75590.0, "bitstamp": 75600.0}
+
+
+class SpotPriceTests(unittest.TestCase):
+    def test_reads_each_exchange_reply(self):
+        replies = {
+            md.BINANCE_PRICE_URL: {"price": "75680.00"},
+            md.COINBASE_PRICE_URL: {"price": "75580.00"},
+            md.KRAKEN_PRICE_URL: {"error": [], "result": {"XXBTZUSD": {"c": ["75590.0", "0.01"]}}},
+            md.BITSTAMP_PRICE_URL: {"last": "75600"},
+        }
+        with mock.patch.object(md, "get_json", side_effect=lambda url, **params: replies[url]):
+            self.assertEqual(md.fetch_spot_prices(), SPOT)
+
+    def test_kraken_error_reply_becomes_none(self):
+        with mock.patch.object(md, "get_json", return_value={"error": ["EService:Unavailable"], "result": {}}):
+            self.assertIsNone(md.fetch_spot_prices()["kraken"])
+
+
+class BrtiProxyTests(unittest.TestCase):
+    def test_three_evenly_spread_prices(self):
+        self.assertAlmostEqual(md.brti_proxy(SPOT), 75590.0)
+
+    def test_binance_is_ignored(self):
+        self.assertAlmostEqual(md.brti_proxy(dict(SPOT, binance=99999.0)), 75590.0)
+
+    def test_two_of_three(self):
+        self.assertAlmostEqual(md.brti_proxy(dict(SPOT, kraken=None)), 75590.0)
+
+    def test_nothing_available(self):
+        self.assertIsNone(md.brti_proxy({"binance": 75680.0, "coinbase": None, "kraken": None, "bitstamp": None}))
+
+
+class DangerZoneTests(unittest.TestCase):
+    def test_strike_between_the_two_prices_is_in_the_zone(self):
+        self.assertTrue(md.in_danger_zone(75600.0, 75680.0, 75580.0, minutes_left=1))
+
+    def test_strike_far_from_both_prices_is_safe_near_settlement(self):
+        self.assertFalse(md.in_danger_zone(80000.0, 75680.0, 75580.0, minutes_left=1))
+        self.assertFalse(md.in_danger_zone(70000.0, 75680.0, 75580.0, minutes_left=1))
+
+
+def zone_row(ticker, ts, strike, coinbase=75580.0, k_result="yes", p_result="no"):
+    return (ticker, "1", "kalshi_yes_poly_no", ts, 0.05, k_result, p_result,
+            strike, 1.0, 75680.0, coinbase, 75590.0, 75600.0)
+
+
+class SplitByDangerZoneTests(unittest.TestCase):
+    def test_trade_is_taken_at_its_first_safe_quote(self):
+        rows = [zone_row("A", "t1", 75620.0), zone_row("A", "t2", 80000.0), zone_row("A", "t3", 81000.0)]
+        taken, skipped = main.split_by_danger_zone(rows)
+        self.assertEqual([row[3] for row in taken], ["t2"])
+        self.assertEqual(skipped, [])
+
+    def test_trade_with_only_risky_quotes_is_skipped(self):
+        taken, skipped = main.split_by_danger_zone([zone_row("B", "t1", 75620.0, k_result="no", p_result="yes")])
+        self.assertEqual(taken, [])
+        self.assertEqual(main.trade_result(*itemgetter(2, 4, 5, 6)(skipped[0])), (0, 0.05 - 1))
+
+    def test_quote_without_a_stand_in_is_left_out(self):
+        row = zone_row("C", "t1", 80000.0)
+        row = row[:10] + (75580.0, None, None)  # only Coinbase, from before Kraken and Bitstamp were logged
+        self.assertEqual(main.split_by_danger_zone([row]), ([], []))
+
+
 class UpgradeTests(unittest.TestCase):
+    def test_old_prices_table_gains_kraken_and_bitstamp(self):
+        import os
+        import sqlite3
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "old.db")
+        old = sqlite3.connect(path)
+        old.execute("CREATE TABLE prices (ts TEXT, binance REAL, coinbase REAL)")
+        old.execute("INSERT INTO prices VALUES ('t0', 1.0, 2.0)")
+        old.commit()
+        old.close()
+        db = main.open_db(path)
+        self.assertEqual(db.execute("SELECT * FROM prices").fetchone(), ("t0", 1.0, 2.0, None, None))
+        main.open_db(path).close()
+        db.close()
+
     def test_old_database_gains_minutes_left(self):
         import os
         import sqlite3
@@ -210,7 +291,7 @@ class ScanTests(unittest.TestCase):
             mock.patch.object(main, "fetch_kalshi_book", return_value=k_book),
             mock.patch.object(main, "fetch_poly_book", return_value=p_book),
             mock.patch.object(main, "book_flags", return_value=[]),
-            mock.patch.object(main, "fetch_spot_prices", return_value={"binance": 75680.0, "coinbase": 75580.0}),
+            mock.patch.object(main, "fetch_spot_prices", return_value=SPOT),
         ]
         for patch in patches:
             patch.start()
@@ -282,15 +363,18 @@ class ScanTests(unittest.TestCase):
 
     def test_scan_logs_prices_and_minutes_left(self):
         main.scan(self.db, now=BEFORE)
-        self.assertEqual(self.db.execute("SELECT binance, coinbase FROM prices").fetchone(), (75680.0, 75580.0))
+        self.assertEqual(self.db.execute("SELECT binance, coinbase, kraken, bitstamp FROM prices").fetchone(),
+                         (75680.0, 75580.0, 75590.0, 75600.0))
         self.assertEqual({row[0] for row in self.db.execute("SELECT minutes_left FROM quotes")}, {10.0})
-        self.assertIn("Binance minus Coinbase over 1 scans: average $+100.00, range $+100.00 to $+100.00",
-                      self.report_lines())
+        lines = self.report_lines()
+        self.assertIn("Binance minus Coinbase over 1 scans: average $+100.00, range $+100.00 to $+100.00", lines)
+        self.assertIn("Binance minus BRTI stand-in over 1 scans: average $+90.00, range $+90.00 to $+90.00", lines)
 
     def test_missing_price_is_stored_as_null(self):
-        with mock.patch.object(main, "fetch_spot_prices", return_value={"binance": None, "coinbase": 75580.0}):
+        with mock.patch.object(main, "fetch_spot_prices", return_value=dict(SPOT, binance=None, kraken=None)):
             main.scan(self.db, now=BEFORE)
-        self.assertEqual(self.db.execute("SELECT binance, coinbase FROM prices").fetchone(), (None, 75580.0))
+        self.assertEqual(self.db.execute("SELECT binance, coinbase, kraken, bitstamp FROM prices").fetchone(),
+                         (None, 75580.0, None, 75600.0))
 
     def test_report_checks_profitable_quotes_against_results(self):
         main.scan(self.db, now=BEFORE)

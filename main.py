@@ -8,6 +8,7 @@ import requests
 
 from market_data import (
     book_flags,
+    brti_proxy,
     coverage,
     directions,
     fetch_kalshi_book,
@@ -15,6 +16,7 @@ from market_data import (
     fetch_poly_book,
     fetch_poly_markets,
     fetch_spot_prices,
+    in_danger_zone,
     kalshi_settlement,
     legs_won,
     match_markets,
@@ -48,7 +50,7 @@ CREATE TABLE IF NOT EXISTS issues (
     ts TEXT, platform TEXT, market_id TEXT, reason TEXT
 );
 CREATE TABLE IF NOT EXISTS prices (
-    ts TEXT, binance REAL, coinbase REAL
+    ts TEXT, binance REAL, coinbase REAL, kraken REAL, bitstamp REAL
 );
 CREATE TABLE IF NOT EXISTS settlements (
     kalshi_ticker TEXT, poly_id TEXT, strike REAL, settles_at TEXT,
@@ -67,6 +69,10 @@ def open_db(path=DB_PATH):
     columns = {row[1] for row in db.execute("PRAGMA table_info(quotes)")}
     if "minutes_left" not in columns:
         db.execute("ALTER TABLE quotes ADD COLUMN minutes_left REAL")
+    columns = {row[1] for row in db.execute("PRAGMA table_info(prices)")}
+    for name in ("kraken", "bitstamp"):
+        if name not in columns:
+            db.execute(f"ALTER TABLE prices ADD COLUMN {name} REAL")
     return db
 
 
@@ -174,7 +180,8 @@ def scan(db, now=None):
     pairs = match_markets(kalshi_markets, poly_markets)
     seen = coverage(kalshi_markets, poly_markets)
     spot = fetch_spot_prices()
-    db.execute("INSERT INTO prices VALUES (?, ?, ?)", (stamp, spot["binance"], spot["coinbase"]))
+    db.execute("INSERT INTO prices (ts, binance, coinbase, kraken, bitstamp) VALUES (?, ?, ?, ?, ?)",
+               (stamp, spot["binance"], spot["coinbase"], spot["kraken"], spot["bitstamp"]))
 
     for k, p in pairs:
         try:
@@ -194,9 +201,10 @@ def scan(db, now=None):
     print(f"Shared settlement times: {seen['shared_times']}, matched pairs: {len(pairs)}")
     print("Closest settlement gap at an equal strike:",
           f"{gap:.0f} minutes" if gap is not None else "no equal strikes")
-    if spot["binance"] is not None and spot["coinbase"] is not None:
-        print(f"BTC: Binance ${spot['binance']:,.2f}, Coinbase ${spot['coinbase']:,.2f},"
-              f" gap ${spot['binance'] - spot['coinbase']:+,.2f}")
+    proxy = brti_proxy(spot)
+    if spot["binance"] is not None and proxy is not None:
+        print(f"BTC: Binance ${spot['binance']:,.2f}, BRTI stand-in ${proxy:,.2f},"
+              f" gap ${spot['binance'] - proxy:+,.2f}")
 
 
 def one_quote_per_trade(rows):
@@ -210,6 +218,33 @@ def one_quote_per_trade(rows):
         trades.setdefault(row[:3], row)
     
     return list(trades.values())
+
+def trade_result(direction, net, kalshi_result, poly_result):
+    """(legs won, dollars per contract). Cost including fees is 1 - net, and each winning leg pays $1."""
+    won = legs_won(direction, kalshi_result, poly_result)
+    return won, won - 1 + net
+
+
+def split_by_danger_zone(rows):
+    """Split settled trades into ones a danger-zone rule would take and ones it would skip.
+
+    Rows are (kalshi_ticker, poly_id, direction, ts, net, kalshi_result, poly_result,
+    strike, minutes_left, binance, coinbase, kraken, bitstamp), oldest first, profitable quotes only.
+    A trade is taken at its first quote outside the zone. A trade whose quotes were all inside is
+    skipped, and judged by its first quote. Quotes without a BRTI stand-in are left out.
+    """
+    safe, risky = [], []
+    for row in rows:
+        strike, minutes_left, binance = row[7:10]
+        brti = brti_proxy(dict(zip(("coinbase", "kraken", "bitstamp"), row[10:13])))
+        if brti is None:
+            continue
+        (risky if in_danger_zone(strike, binance, brti, minutes_left) else safe).append(row[:7])
+    taken = one_quote_per_trade(safe)
+    taken_keys = {row[:3] for row in taken}
+    skipped = [row for row in one_quote_per_trade(risky) if row[:3] not in taken_keys]
+    return taken, skipped
+
 
 def gap_runs(points):
     """Find each stretch of back-to-back profitable scans for one trade.
@@ -279,14 +314,30 @@ def report(db):
         "SELECT q.kalshi_ticker, q.poly_id, q.direction, q.ts, q.net_per_contract, s.kalshi_result, s.poly_result"
         " FROM quotes q JOIN settlements s ON q.kalshi_ticker = s.kalshi_ticker AND q.poly_id = s.poly_id"
         " WHERE q.net_per_contract > 0 AND q.flags = '' AND s.poly_result IS NOT NULL ORDER BY q.ts").fetchall()
-    outcomes = [row[2:] for row in one_quote_per_trade(rows)]
+    outcomes = one_quote_per_trade(rows)
     if outcomes:
-        legs = [legs_won(direction, k_result, p_result) for direction, _, _, k_result, p_result in outcomes]
-        # Cost per contract including fees is 1 - net, and each winning leg pays $1.
-        results = [won - 1 + net for won, (_, _, net, _, _) in zip(legs, outcomes)]
+        legs, results = zip(*(trade_result(row[2], row[4], row[5], row[6]) for row in outcomes))
         print(f"Profitable quotes now settled: {len(outcomes)}  paid once: {legs.count(1)}"
               f"  lost both legs: {legs.count(0)}  won both: {legs.count(2)}")
         print(f"Average real result per contract: ${sum(results) / len(results):.4f}")
+
+    zone_rows = db.execute(
+        "SELECT q.kalshi_ticker, q.poly_id, q.direction, q.ts, q.net_per_contract, s.kalshi_result, s.poly_result,"
+        " s.strike, q.minutes_left, p.binance, p.coinbase, p.kraken, p.bitstamp"
+        " FROM quotes q JOIN settlements s ON q.kalshi_ticker = s.kalshi_ticker AND q.poly_id = s.poly_id"
+        " JOIN prices p ON p.ts = q.ts"
+        " WHERE q.net_per_contract > 0 AND q.flags = '' AND s.poly_result IS NOT NULL"
+        " AND p.binance IS NOT NULL ORDER BY q.ts").fetchall()
+    taken, skipped = split_by_danger_zone(zone_rows)
+    if taken or skipped:
+        print("Danger zone check (settled trades with a BRTI stand-in):")
+        for label, group in (("outside zone, would take", taken), ("inside zone, would skip", skipped)):
+            if not group:
+                print(f"  {label}: 0")
+                continue
+            legs, results = zip(*(trade_result(row[2], row[4], row[5], row[6]) for row in group))
+            print(f"  {label}: {len(group)}  paid once: {legs.count(1)}  lost both legs: {legs.count(0)}"
+                  f"  avg ${sum(results) / len(results):+.4f}/contract")
 
     durations = sorted(gap_durations(db))
     if durations:
@@ -301,6 +352,16 @@ def report(db):
     if count:
         print(f"Binance minus Coinbase over {count} scans: average ${average:+,.2f},"
               f" range ${low:+,.2f} to ${high:+,.2f}")
+
+    gaps = []
+    for binance, coinbase, kraken, bitstamp in db.execute(
+            "SELECT binance, coinbase, kraken, bitstamp FROM prices WHERE binance IS NOT NULL"):
+        proxy = brti_proxy({"coinbase": coinbase, "kraken": kraken, "bitstamp": bitstamp})
+        if proxy is not None:
+            gaps.append(binance - proxy)
+    if gaps:
+        print(f"Binance minus BRTI stand-in over {len(gaps)} scans: average ${sum(gaps) / len(gaps):+,.2f},"
+              f" range ${min(gaps):+,.2f} to ${max(gaps):+,.2f}")
 
     print("Data issues:")
     # Error messages include the URL, so group by the error's name, e.g. "ConnectionError".

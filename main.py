@@ -28,6 +28,8 @@ DB_PATH = "market_data.db"
 SCAN_SECONDS = 60
 # Polymarket can take an hour or more to resolve, so don't ask about every pair every minute.
 SETTLE_CHECK_MINUTES = 5
+# Scans run about a minute apart; a longer silence means the scanner or network was down.
+MAX_SCAN_GAP_MINUTES = 3
 SCAN_ERRORS = (requests.RequestException, KeyError, TypeError, ValueError, sqlite3.Error)
 
 SCHEMA = """
@@ -209,6 +211,46 @@ def one_quote_per_trade(rows):
     
     return list(trades.values())
 
+def gap_runs(points):
+    """Find each stretch of back-to-back profitable scans for one trade.
+
+    points is [(datetime, net_per_contract or None)] oldest first. A run ends at a scan that
+    isn't profitable (net <= 0 or None), or when scans are over MAX_SCAN_GAP_MINUTES apart.
+    Returns [(first_time, last_time)] for each run.
+    """
+    runs = []
+    start = end = None
+    for when, net in points:
+        if net is not None and net > 0:
+            if start is not None and (when - end).total_seconds() / 60 <= MAX_SCAN_GAP_MINUTES:
+                end = when
+            else:
+                if start is not None:
+                    runs.append((start, end))
+                start = end = when
+        elif start is not None:
+                runs.append((start, end))
+                start = end = None
+    if start is not None:
+                runs.append((start, end))
+    return runs
+    
+
+
+def gap_durations(db):
+    """Minutes each profitable gap stayed open. A gap seen in only one scan lasted 0 minutes."""
+    points = {}
+    for ticker, poly_id, direction, ts, net in db.execute(
+            "SELECT kalshi_ticker, poly_id, direction, ts, CASE WHEN flags = '' THEN net_per_contract END"
+            " FROM quotes ORDER BY ts"):
+        points.setdefault((ticker, poly_id, direction), []).append((parse_time(ts), net))
+    return [
+        (end - start).total_seconds() / 60
+        for trade_points in points.values()
+        for start, end in gap_runs(trade_points)
+    ]
+
+
 def report(db):
     scans, with_pairs = db.execute(
         "SELECT COUNT(*), COALESCE(SUM(matched_pairs > 0), 0) FROM scans").fetchone()
@@ -245,6 +287,13 @@ def report(db):
         print(f"Profitable quotes now settled: {len(outcomes)}  paid once: {legs.count(1)}"
               f"  lost both legs: {legs.count(0)}  won both: {legs.count(2)}")
         print(f"Average real result per contract: ${sum(results) / len(results):.4f}")
+
+    durations = sorted(gap_durations(db))
+    if durations:
+        median = durations[len(durations) // 2]
+        lasting = sum(minutes >= 5 for minutes in durations)
+        print(f"Profitable gaps: {len(durations)}  median open {median:.0f} min,"
+              f" open 5+ min: {lasting}, longest {durations[-1]:.0f} min")
 
     count, average, low, high = db.execute(
         "SELECT COUNT(*), AVG(binance - coinbase), MIN(binance - coinbase), MAX(binance - coinbase)"

@@ -153,6 +153,30 @@ class MatchTests(unittest.TestCase):
         self.assertIsNone(md.coverage([KALSHI], [dict(POLY, strike=70000.0)])["closest_gap_minutes"])
 
 
+def at(minute):
+    return SETTLES + timedelta(minutes=minute)
+
+
+class GapRunTests(unittest.TestCase):
+    def test_no_points(self):
+        self.assertEqual(main.gap_runs([]), [])
+
+    def test_unprofitable_scan_ends_a_run(self):
+        points = [(at(0), 0.5), (at(1), 0.3), (at(2), -0.1), (at(3), 0.2)]
+        self.assertEqual(main.gap_runs(points), [(at(0), at(1)), (at(3), at(3))])
+
+    def test_missing_price_ends_a_run(self):
+        points = [(at(0), 0.5), (at(1), None), (at(2), 0.4)]
+        self.assertEqual(main.gap_runs(points), [(at(0), at(0)), (at(2), at(2))])
+
+    def test_long_silence_ends_a_run(self):
+        points = [(at(0), 0.5), (at(10), 0.4), (at(11), 0.4)]
+        self.assertEqual(main.gap_runs(points), [(at(0), at(0)), (at(10), at(11))])
+
+    def test_run_still_open_at_the_end_is_kept(self):
+        self.assertEqual(main.gap_runs([(at(0), -0.2), (at(1), 0.1), (at(2), 0.1)]), [(at(1), at(2))])
+
+
 class UpgradeTests(unittest.TestCase):
     def test_old_database_gains_minutes_left(self):
         import os

@@ -3,3 +3,4 @@ paper_trades.db
 market_data.db
 *.db-journal
 backtest.db
+sports.db

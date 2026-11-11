@@ -46,6 +46,7 @@ pip install requests
 python main.py            # run one scan
 python main.py --loop     # scan every 60 seconds
 python main.py --report   # summarize the logged data
+python backtest.py        # replay the reverse trade on about 60 days of settled hours
 python -m unittest        # run the tests
 ```
 

@@ -33,7 +33,7 @@ The two platforms settle on **different prices**. Kalshi uses a 60-second averag
 
 ## Results
 
-About five days of live scans (1,350 settled pairs) and a 60-day backtest gave a clear answer: **no reliable edge.**
+About four days of live scans (1,350 settled pairs) and a 60-day backtest gave a clear answer: **no reliable edge.**
 
 - **Kalshi-Yes + Polymarket-No** showed "profitable" quotes but lost in every bucket: 240 settled trades averaged -$0.052 per contract. The two settlement prices were about $100 apart, so both legs often lost.
 - **Polymarket-Yes + Kalshi-No** looked good live (+$0.07 per contract over 81 trades). `backtest.py` replayed it on 57 earlier days (2,728 trades). After correcting a bias of about $0.08 per contract in the backtest's own price estimate, the result was about zero or negative.

@@ -49,6 +49,18 @@ python main.py --report   # summarize the logged data
 python -m unittest        # run the tests
 ```
 
+## Run it on a server
+
+`deploy/setup.sh` installs the scanner as a `systemd` service on an Ubuntu server, so it starts on boot and restarts after a crash:
+
+```bash
+git clone -b order-book-data https://github.com/baiqiefan/Python-Arbitrage.git
+cd Python-Arbitrage
+bash deploy/setup.sh
+```
+
+Pick a server outside the US: Binance blocks US addresses, and the Binance price is half of the comparison.
+
 Each scan prints any matched pairs with their prices and profit after fees, then a summary of how many markets were open and how close the platforms came to matching.
 
 `paper_trade.py` holds simulated trading code that is parked until the scanner has collected enough data to choose a trading rule.

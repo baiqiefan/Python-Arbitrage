@@ -1,0 +1,15 @@
+[Unit]
+Description=Kalshi vs Polymarket BTC scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=SCANNER_USER
+WorkingDirectory=SCANNER_DIR
+# -u prints each line straight away, so "journalctl -f" shows scans as they happen.
+ExecStart=/usr/bin/python3 -u main.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

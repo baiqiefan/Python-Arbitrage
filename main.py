@@ -2,6 +2,7 @@
 import argparse
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -32,6 +33,14 @@ SCAN_SECONDS = 60
 SETTLE_CHECK_MINUTES = 5
 # Scans run about a minute apart; a longer silence means the scanner or network was down.
 MAX_SCAN_GAP_MINUTES = 3
+# Pairs whose order books are fetched at the same time. Kept low to stay under the sites' rate limits.
+BOOK_WORKERS = 5
+# The reverse trade buys Polymarket-YES + Kalshi-NO. Binance (Polymarket's price) runs about $100
+# above BRTI (Kalshi's), so this trade can win both legs when the strike ends between them.
+# The rule was picked from data up to REVERSE_RULE_CHOSEN, so only later data is a fair test of it.
+REVERSE_MIN_NET = -0.10
+REVERSE_STRIKE_BELOW_BINANCE = (100, 400)
+REVERSE_RULE_CHOSEN = "2026-11-11"
 SCAN_ERRORS = (requests.RequestException, KeyError, TypeError, ValueError, sqlite3.Error)
 
 SCHEMA = """
@@ -90,11 +99,13 @@ QUOTE_COLUMNS = (
 )
 
 
-def scan_pair(db, now, k, p):
+def fetch_books(k, p):
+    return fetch_kalshi_book(k["ticker"]), fetch_poly_book(p["yes_token"])
+
+
+def scan_pair(db, now, k, p, k_book, p_book):
     minutes_left = (p["settles_at"] - now).total_seconds() / 60
     now = now.isoformat()
-    k_book = fetch_kalshi_book(k["ticker"])
-    p_book = fetch_poly_book(p["yes_token"])
     leg_gap = abs((p_book["fetched_at"] - k_book["fetched_at"]).total_seconds())
 
     k_flags = book_flags(k_book)
@@ -150,6 +161,10 @@ def settle_pairs(db, now):
         try:
             k_result, k_value = kalshi_settlement(ticker)
             p_result = poly_result(poly_id) if k_result else None
+        except requests.ConnectionError as error:
+            # The network is down, so every other lookup would fail too. Try again next scan.
+            record_issue(db, now.isoformat(), "settlement", f"{ticker}/{poly_id}", repr(error))
+            break
         except (requests.RequestException, KeyError, TypeError, ValueError) as error:
             record_issue(db, now.isoformat(), "settlement", f"{ticker}/{poly_id}", repr(error))
             # Wait the usual interval before retrying, instead of failing every scan.
@@ -183,9 +198,12 @@ def scan(db, now=None):
     db.execute("INSERT INTO prices (ts, binance, coinbase, kraken, bitstamp) VALUES (?, ?, ?, ?, ?)",
                (stamp, spot["binance"], spot["coinbase"], spot["kraken"], spot["bitstamp"]))
 
-    for k, p in pairs:
+    # Only the web requests run in threads; the database is written from this thread alone.
+    with ThreadPoolExecutor(max_workers=BOOK_WORKERS) as pool:
+        books = [pool.submit(fetch_books, k, p) for k, p in pairs]
+    for (k, p), fetched in zip(pairs, books):
         try:
-            scan_pair(db, now, k, p)
+            scan_pair(db, now, k, p, *fetched.result())
         except (requests.RequestException, KeyError, TypeError, ValueError) as error:
             record_issue(db, stamp, "pair", f"{k['ticker']}/{p['id']}", repr(error))
             print(f"\n{k['ticker']} vs Polymarket {p['id']}: book failed, {error}")
@@ -244,6 +262,17 @@ def split_by_danger_zone(rows):
     taken_keys = {row[:3] for row in taken}
     skipped = [row for row in one_quote_per_trade(risky) if row[:3] not in taken_keys]
     return taken, skipped
+
+
+def reverse_trades(rows):
+    """Settled trades the reverse rule would have taken, one per pair, at its first matching quote.
+
+    Rows are (kalshi_ticker, poly_id, direction, ts, net, kalshi_result, poly_result, strike, binance),
+    oldest first, for the poly_yes_kalshi_no direction.
+    """
+    low, high = REVERSE_STRIKE_BELOW_BINANCE
+    return one_quote_per_trade(
+        row[:7] for row in rows if row[4] > REVERSE_MIN_NET and low <= row[8] - row[7] < high)
 
 
 def gap_runs(points):
@@ -337,6 +366,27 @@ def report(db):
                 continue
             legs, results = zip(*(trade_result(row[2], row[4], row[5], row[6]) for row in group))
             print(f"  {label}: {len(group)}  paid once: {legs.count(1)}  lost both legs: {legs.count(0)}"
+                  f"  avg ${sum(results) / len(results):+.4f}/contract")
+
+    reverse_rows = db.execute(
+        "SELECT q.kalshi_ticker, q.poly_id, q.direction, q.ts, q.net_per_contract, s.kalshi_result, s.poly_result,"
+        " s.strike, p.binance"
+        " FROM quotes q JOIN settlements s ON q.kalshi_ticker = s.kalshi_ticker AND q.poly_id = s.poly_id"
+        " JOIN prices p ON p.ts = q.ts"
+        " WHERE q.direction = 'poly_yes_kalshi_no' AND q.net_per_contract IS NOT NULL AND q.flags = ''"
+        " AND s.poly_result IS NOT NULL AND p.binance IS NOT NULL ORDER BY q.ts").fetchall()
+    reverse = reverse_trades(reverse_rows)
+    if reverse:
+        print(f"Reverse trade test (Polymarket-YES + Kalshi-NO, strike ${REVERSE_STRIKE_BELOW_BINANCE[0]}"
+              f"-{REVERSE_STRIKE_BELOW_BINANCE[1]} below Binance):")
+        for label, group in (
+                ("data the rule was picked from", [row for row in reverse if row[3] < REVERSE_RULE_CHOSEN]),
+                ("new data, the fair test", [row for row in reverse if row[3] >= REVERSE_RULE_CHOSEN])):
+            if not group:
+                print(f"  {label}: 0")
+                continue
+            legs, results = zip(*(trade_result(row[2], row[4], row[5], row[6]) for row in group))
+            print(f"  {label}: {len(group)}  won both: {legs.count(2)}  lost both: {legs.count(0)}"
                   f"  avg ${sum(results) / len(results):+.4f}/contract")
 
     durations = sorted(gap_durations(db))

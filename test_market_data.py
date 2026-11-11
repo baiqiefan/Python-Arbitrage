@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from operator import itemgetter
 from unittest import mock
 
+import requests
+
 import main
 import market_data as md
 
@@ -243,6 +245,22 @@ class SplitByDangerZoneTests(unittest.TestCase):
         self.assertEqual(main.split_by_danger_zone([row]), ([], []))
 
 
+class ReverseTradeTests(unittest.TestCase):
+    def row(self, ticker, ts, net, strike, binance=75680.0):
+        return (ticker, "1", "poly_yes_kalshi_no", ts, net, "no", "yes", strike, binance)
+
+    def test_takes_first_quote_with_strike_just_below_binance(self):
+        rows = [self.row("A", "t1", -0.20, 75500.0),   # too expensive
+                self.row("A", "t2", -0.03, 75500.0),   # taken
+                self.row("A", "t3", -0.01, 75500.0),
+                self.row("B", "t1", -0.03, 75650.0),   # strike only $30 below Binance
+                self.row("C", "t1", -0.03, 75000.0)]   # strike $680 below Binance
+        taken = main.reverse_trades(rows)
+        self.assertEqual([(row[0], row[3]) for row in taken], [("A", "t2")])
+        # Both legs paid: Kalshi settled no (BRTI below the strike), Polymarket yes (Binance above).
+        self.assertEqual(main.trade_result(*itemgetter(2, 4, 5, 6)(taken[0]))[0], 2)
+
+
 class UpgradeTests(unittest.TestCase):
     def test_old_prices_table_gains_kraken_and_bitstamp(self):
         import os
@@ -351,6 +369,16 @@ class ScanTests(unittest.TestCase):
             main.settle_pairs(self.db, AFTER + timedelta(minutes=main.SETTLE_CHECK_MINUTES))
         self.assertEqual(self.db.execute("SELECT kalshi_result, kalshi_value, poly_result FROM settlements").fetchone(),
                          ("yes", 82100.0, "no"))
+
+    def test_settlement_lookups_stop_at_the_first_connection_error(self):
+        main.scan(self.db, now=BEFORE)
+        self.db.execute("INSERT INTO settlements (kalshi_ticker, poly_id, settles_at) VALUES ('OTHER', '2', ?)",
+                        (SETTLES.isoformat(),))
+        with mock.patch.object(main, "kalshi_settlement", side_effect=requests.ConnectTimeout("down")) as kalshi:
+            main.settle_pairs(self.db, AFTER)
+            main.settle_pairs(self.db, AFTER)  # not delayed by SETTLE_CHECK_MINUTES: nothing was checked
+        self.assertEqual(kalshi.call_count, 2)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM issues WHERE platform = 'settlement'").fetchone()[0], 2)
 
     def test_report_groups_errors_by_type(self):
         for minute, url in (("09:06", "/markets/A"), ("09:07", "/markets/B")):

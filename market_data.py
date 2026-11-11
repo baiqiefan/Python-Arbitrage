@@ -28,12 +28,17 @@ BRTI_STAND_INS = ("coinbase", "kraken", "bitstamp")
 MAX_CONTRACTS = 100
 # Kalshi strikes end in .99 (81999.99) and Polymarket's are round (82000).
 MAX_STRIKE_GAP = 0.02
+# Roughly one standard deviation of BTC's move per sqrt(minute) is about $50.
 DANGER_DOLLARS_PER_SQRT_MINUTE = 50
 KALSHI_FEE_RATE = 0.07
 
 
+# One shared session keeps a connection open to each site, instead of a new handshake per request.
+SESSION = requests.Session()
+
+
 def get_json(url, **params):
-    response = requests.get(url, params=params, timeout=15)
+    response = SESSION.get(url, params=params, timeout=15)
     response.raise_for_status()
     return response.json()
 

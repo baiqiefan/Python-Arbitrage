@@ -31,6 +31,14 @@ Polymarket's daily markets settle at **noon ET** (16:00 UTC in daylight saving t
 
 The two platforms settle on **different prices**. Kalshi uses a 60-second average of the CF Benchmarks BRTI index, while Polymarket uses a Binance BTC/USDT candle close. If those land on opposite sides of the strike, the two legs can both lose. The scanner records both sources with every quote.
 
+## Results
+
+About five days of live scans (1,350 settled pairs) and a 60-day backtest gave a clear answer: **no reliable edge.**
+
+- **Kalshi-Yes + Polymarket-No** showed "profitable" quotes but lost in every bucket: 240 settled trades averaged -$0.052 per contract. The two settlement prices were about $100 apart, so both legs often lost.
+- **Polymarket-Yes + Kalshi-No** looked good live (+$0.07 per contract over 81 trades). `backtest.py` replayed it on 57 earlier days (2,728 trades). After correcting a bias of about $0.08 per contract in the backtest's own price estimate, the result was about zero or negative.
+- **The lesson:** the market already prices the gap between the two settlement sources about right, and a small lucky sample can look like an edge.
+
 ## Requirements
 
 - Python 3.9+
@@ -47,8 +55,6 @@ python main.py            # run one scan
 python main.py --loop     # scan every 60 seconds
 python main.py --report   # summarize the logged data
 python backtest.py        # replay the reverse trade on about 60 days of settled hours
-python sports.py --loop   # log what covering NBA, NFL and NHL games across both sites costs
-python sports.py --report # summarize the sports data
 python -m unittest        # run the tests
 ```
 
